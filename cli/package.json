@@ -24,11 +24,14 @@
     "prepack": "cp ../README.md ./"
   },
   "dependencies": {
-    "@pnpm/find-workspace-dir": "^6.0.2",
-    "@pnpm/find-workspace-packages": "^6.0.9",
+    "@pnpm/dependency-path": "^5.1.4",
+    "@pnpm/find-workspace-dir": "^7.0.0",
     "@pnpm/fs.packlist": "^2.0.0",
-    "@pnpm/logger": "^5.0.0",
-    "@pnpm/read-project-manifest": "^5.0.2",
+    "@pnpm/lockfile.fs": "^1.0.1",
+    "@pnpm/logger": "^5.1.0",
+    "@pnpm/read-project-manifest": "^6.0.0",
+    "@pnpm/types": "^12.0.0",
+    "@pnpm/workspace.find-packages": "^4.0.7",
     "debug": "^4.3.4",
     "dettle": "^1.0.4",
     "proper-lockfile": "^4.1.2",

@@ -5,13 +5,12 @@ import { syncFile } from './syncFile.js';
  * @param {string} dir the current working directory or the directory of a project
  */
 export async function sync(dir) {
-  const packagesToSync = await getPackagesToSync(dir);
+  const packageToSync = await getPackagesToSync(dir);
 
   await Promise.all(
-    packagesToSync.flatMap(async ({ filesToSync }) =>
-      Object.entries(filesToSync).map(async ([syncFrom, syncTo]) =>
-        syncFile(syncFrom, syncTo)
-      )
+    Object.entries(packageToSync.filesToSync).flatMap(
+      async ([syncFrom, syncToPaths]) =>
+        syncToPaths.map((syncTo) => syncFile(syncFrom, syncTo))
     )
   );
 }

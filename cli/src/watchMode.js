@@ -27,32 +27,32 @@ export async function watchMode(dir) {
   async function handleDirtyPaths() {
     debug('handling dirty paths');
 
-    const packagesToSync = await getPackagesToSync(dir);
+    const packageToSync = await getPackagesToSync(dir);
 
     await watcher.watchPaths(
-      packagesToSync.map(({ project }) => project.dir),
+      [packageToSync.project.dir],
       { recursive: true },
       () => {}
     );
 
     if (unlinkPaths.size) {
       await Promise.all(
-        [...unlinkPaths.entries()].map(async ([unlinkPath, event]) => {
-          const matchingPackage = packagesToSync.find((p) =>
-            unlinkPath.startsWith(p.project.dir)
-          );
+        [...unlinkPaths.entries()].flatMap(async ([unlinkPath, event]) => {
+          if (!unlinkPath.startsWith(packageToSync.project.dir)) return;
 
-          if (!matchingPackage) return;
+          return packageToSync.injectionPaths.map(async (targetDir) => {
+            const pathToRemove = join(
+              targetDir,
+              unlinkPath.slice(packageToSync.project.dir.length + 1)
+            );
 
-          const pathToRemove = join(
-            matchingPackage.targetDir,
-            unlinkPath.slice(matchingPackage.project.dir.length + 1)
-          );
-
-          debug(`unlinking ${pathToRemove}`);
-          await fs.rm(pathToRemove, {
-            recursive: event === 'unlinkDir',
-            force: true,
+            debug(`unlinking ${pathToRemove}`);
+            /*
+            await fs.rm(pathToRemove, {
+              recursive: event === 'unlinkDir',
+              force: true,
+            });
+            */
           });
         })
       );
@@ -61,18 +61,14 @@ export async function watchMode(dir) {
     }
 
     if (dirtyPaths.size) {
-      /** @type {{ [fromPath: string]: string}} */
+      /** @type {{ [fromPath: string]: string[]}} */
       const syncTasks = {};
 
       for (const dirtyPath of dirtyPaths) {
-        const matchingPackage = packagesToSync.find((p) =>
-          dirtyPath.startsWith(p.project.dir)
-        );
+        if (!dirtyPath.startsWith(packageToSync.project.dir)) return;
 
-        if (!matchingPackage) return;
-
-        if (matchingPackage.filesToSync[dirtyPath]) {
-          syncTasks[dirtyPath] = matchingPackage.filesToSync[dirtyPath];
+        if (packageToSync.filesToSync[dirtyPath]) {
+          syncTasks[dirtyPath] = packageToSync.filesToSync[dirtyPath];
         } else {
           debug(`path not under watched root ${dirtyPath}`);
         }
@@ -81,8 +77,8 @@ export async function watchMode(dir) {
       dirtyPaths = new Set();
 
       await Promise.all(
-        Object.entries(syncTasks).map(([syncFrom, syncTo]) =>
-          syncFile(syncFrom, syncTo)
+        Object.entries(syncTasks).map(([syncFrom, syncToPaths]) =>
+          syncToPaths.map((syncTo) => syncFile(syncFrom, syncTo))
         )
       );
     }

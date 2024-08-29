@@ -1,16 +1,21 @@
-import path, { dirname, join } from 'node:path';
+import fs from 'node:fs/promises';
+import path, { join } from 'node:path';
 
+import { depPathToFilename } from '@pnpm/dependency-path';
 import { findWorkspaceDir } from '@pnpm/find-workspace-dir';
-import { findWorkspacePackages } from '@pnpm/find-workspace-packages';
 import { packlist } from '@pnpm/fs.packlist';
+import { readWantedLockfile } from '@pnpm/lockfile.fs';
 import { readExactProjectManifest } from '@pnpm/read-project-manifest';
 import Debug from 'debug';
-import resolvePackageManifestPath from 'resolve-package-path';
 
 const debug = Debug('sync-pnpm');
 
 /**
- * @param {string} dir the current working directory or the directory of a project
+ * @typedef {import('@pnpm/types').Project} Project
+ */
+
+/**
+ * @param {Project['rootDir']} dir the current working directory or the directory of a project
  */
 export async function getPackagesToSync(dir) {
   const root = await findWorkspaceDir(dir);
@@ -20,63 +25,30 @@ export async function getPackagesToSync(dir) {
   }
 
   const localManifestPath = path.join(dir, 'package.json');
-  const ownProject = await readExactProjectManifest(localManifestPath);
-  const injectedDependencyNames = injectedDeps({ dir, ...ownProject });
+  const project = {
+    dir,
+    ...(await readExactProjectManifest(localManifestPath)),
+  };
+  const injectionPaths = await getInjectionPaths(root, project);
 
-  /**
-   * If dependencies are not injected, we don't need to re-link
-   */
-  if (!injectedDependencyNames || injectedDependencyNames?.size === 0) {
-    return [];
+  if (injectionPaths.length === 0) {
+    return { project, injectionPaths, filesToSync: {} };
   }
 
-  const localProjects = await findWorkspacePackages(root);
-
-  return Promise.all(
-    localProjects
-      .filter((p) => {
-        if (!p.manifest.name) return false;
-
-        return injectedDependencyNames.has(p.manifest.name);
-      })
-      .map((project) => {
-        const resolvedPackagePath = resolvePackagePath(
-          project.manifest.name ?? '',
-          dir
-        );
-
-        return {
-          project,
-          targetDir: resolvedPackagePath,
-        };
-      })
-      .filter(({ project, targetDir }) => {
-        if (project.dir === targetDir) {
-          debug(
-            `destination (${targetDir}) is the same as source (${project.dir}), this library (${project.manifest.name}) is not an injected dependency. Did you accidentally use package.json#overrides on an in-monorepo package?`
-          );
-        }
-
-        return project.dir !== targetDir;
-      })
-      .map(async ({ project, targetDir }) => {
-        return {
-          project,
-          targetDir,
-          filesToSync: await getPackageFilesToSync(project, targetDir),
-        };
-      })
-  );
+  return {
+    project,
+    injectionPaths,
+    filesToSync: await getPackageFilesToSync(project, injectionPaths),
+  };
 }
 
 /**
- * @typedef {Awaited<ReturnType<typeof findWorkspacePackages>>[number]} Project
  *
- * @param {Project} project
- * @param {string} targetDir
+ * @param {Project & { dir: string }} project
+ * @param {string[]} injectionPaths
  */
-async function getPackageFilesToSync(project, targetDir) {
-  /** @type { { [syncFrom: string]: string } } */
+async function getPackageFilesToSync(project, injectionPaths) {
+  /** @type { { [syncFrom: string]: string[] } } */
   const pathsToSync = {};
   const name = project.manifest.name ?? '';
 
@@ -87,55 +59,123 @@ async function getPackageFilesToSync(project, targetDir) {
   debug(
     `${name}'s packlist resolved to ${files}:\n` +
       `  Source: ${project.dir}\n` +
-      `  Destination: ${targetDir}`
+      `  Destination: ${injectionPaths}`
   );
 
   for (const file of files) {
     const syncFrom = join(project.dir, file);
-    const syncTo = join(targetDir, file);
 
-    pathsToSync[syncFrom] = syncTo;
+    pathsToSync[syncFrom] = injectionPaths.map((targetDir) =>
+      join(targetDir, file)
+    );
   }
 
   return pathsToSync;
 }
 
 /**
+ * @param {string} root
  * @param {Project} project
  */
-function injectedDeps(project) {
-  const ownPackageJson = project.manifest;
+async function getInjectionPaths(root, project) {
+  const lockfile = await readWantedLockfile(root, { ignoreIncompatible: true });
 
-  const depMeta = ownPackageJson.dependenciesMeta;
+  if (!lockfile) return [];
 
-  if (!depMeta) return;
+  /** @type {Set<string>} */
+  let injectedDependencyToVersion = new Set();
 
-  const injectedDependencyNames = new Set();
+  Object.values(lockfile.importers).forEach((importer) => {
+    getInjectedDependencyToVersion(
+      importer.dependencies,
+      project.manifest.name,
+      injectedDependencyToVersion
+    );
+    getInjectedDependencyToVersion(
+      importer.optionalDependencies,
+      project.manifest.name,
+      injectedDependencyToVersion
+    );
+    getInjectedDependencyToVersion(
+      importer.devDependencies,
+      project.manifest.name,
+      injectedDependencyToVersion
+    );
+  });
 
-  for (const [depName, meta] of Object.entries(depMeta)) {
-    if (meta.injected) {
-      injectedDependencyNames.add(depName);
-    }
+  if (lockfile.packages) {
+    Object.values(lockfile.packages).forEach((pack) => {
+      getInjectedDependencyToVersion(
+        pack.dependencies,
+        project.manifest.name,
+        injectedDependencyToVersion
+      );
+      getInjectedDependencyToVersion(
+        pack.optionalDependencies,
+        project.manifest.name,
+        injectedDependencyToVersion
+      );
+    });
   }
 
-  return injectedDependencyNames;
+  /**
+   * @type {Set<string>}
+   */
+  const injectedDependencyToFilePathSet = new Set();
+
+  for (const injectedDependencyVersion of injectedDependencyToVersion) {
+    // this logic is heavily depends on pnpm-lock formate
+    // the current logic is for pnpm v8
+    // for example: file:../../libraries/lib1(react@16.0.0) -> ../../libraries/lib1
+    let injectedDependencyPath = injectedDependencyVersion
+      .split('(')[0]
+      .slice('file:'.length);
+
+    injectedDependencyPath = path.resolve(root, injectedDependencyPath);
+
+    const fullPackagePath = path.join(
+      path.resolve(root, 'node_modules', '.pnpm'),
+      depPathToFilename(
+        `${project.manifest.name}@${injectedDependencyVersion}`,
+        120
+      ),
+      'node_modules',
+      project.manifest.name
+    );
+
+    injectedDependencyToFilePathSet.add(fullPackagePath);
+  }
+
+  return [...injectedDependencyToFilePathSet.values()];
 }
 
 /**
- * @param {string} name
- * @param {string} startingDirectory resolve from here
- */
-function resolvePackagePath(name, startingDirectory) {
-  const resolvedManifestPath = resolvePackageManifestPath(
-    name,
-    startingDirectory
-  );
+ * @typedef {import('@pnpm/lockfile.fs').ResolvedDependencies} ResolvedDependencies
+ *
+ * @param {ResolvedDependencies | undefined} dependencies
+ * @param {string} wantedDependency
+ * @param {Set<string>} injectedDependencyToVersion
+ * */
+function getInjectedDependencyToVersion(
+  dependencies,
+  wantedDependency,
+  injectedDependencyToVersion
+) {
+  if (!dependencies) return;
 
-  if (!resolvedManifestPath) {
-    throw new Error(`Could not find package, ${name}`);
+  for (const [dependency, specifier] of Object.entries(dependencies)) {
+    if (dependency !== wantedDependency) continue;
+    // the injected dependency should always start with file protocol
+    // and exclude tarball installation
+    // what is the tarball installation, learn more: https://pnpm.io/cli/add#install-from-local-file-system
+
+    const tarballSuffix = ['.tar', '.tar.gz', '.tgz'];
+
+    if (
+      specifier.startsWith('file:') &&
+      !tarballSuffix.some((suffix) => specifier.endsWith(suffix))
+    ) {
+      injectedDependencyToVersion.add(specifier);
+    }
   }
-
-  const resolvedPackagePath = dirname(resolvedManifestPath);
-
-  return resolvedPackagePath;
 }
